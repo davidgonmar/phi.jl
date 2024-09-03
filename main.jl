@@ -6,7 +6,7 @@ using Transformers
 function rotate_half(x::AbstractArray{Float32, 3})::AbstractArray{Float32, 3}
 	x1 = x[:, 1:(end÷2), :]
 	x2 = x[:, (end÷2+1):end, :]
-	return cat(x1, x2, dims = 2)
+	return cat(-x2, x1, dims = 2)
 end
 
 struct RoPE
@@ -34,10 +34,6 @@ function (m::RoPE)(seq::AbstractArray{Float32, 3})::AbstractArray{Float32, 3}
 	# crop sequence length
 	sin, cos = sin[1:size(seq, 1), :], cos[1:size(seq, 1), :]
 	sin, cos = reshape(sin, (size(sin, 1), size(sin, 2), 1)), reshape(cos, (size(cos, 1), size(cos, 2), 1))
-	# print shapes
-	println("sin: ", size(sin))
-	println("cos: ", size(cos))
-	println("seq: ", size(seq))
 	seq .* cos .+ rotate_half(seq) .* sin
 end
 # ======================= RoPE =======================
@@ -52,7 +48,6 @@ end
 
 function (m::MLP)(x)
 	x = m.dense1(x)
-	x = gelu(x)
 	x = m.dense2(x)
 	return x
 end
@@ -112,15 +107,14 @@ function (m::SelfAttention)(x::AbstractMatrix{Float32})
 	k = cat(rotk, origk, dims = 2) # 
 
 
-
 	# scaled dot-product attention
 	# (seq_len, head_dim, n_heads) x (head_dim, seq_len, n_heads) -> (seq_len, seq_len, n_heads)
-	att_scores = Flux.batched_mul(q, permutedims(k, (2, 1, 3))) ./ sqrt(d_model)
+	att_scores = Flux.batched_mul(q, permutedims(k, (2, 1, 3))) ./ sqrt(head_dim)
 
 	# causal masking
 	mask = fill(-Inf, size(att_scores, 1), size(att_scores, 2))
 	mask = Flux.triu!(mask, 1)
-	mask = reshape(mask, (size(mask, 1), size(mask, 2), 1)) # broadcast to n_heads (batch dim)
+	mask = reshape(mask, (size(mask, 1), size(mask, 2), 1)) # broadcast to (seq_len, seq_len, 1)
 	att_scores = softmax(att_scores .+ mask, dims = 2) # (seq_len, seq_len, n_heads)
 
 	# gather values (seq_len, seq_len, n_heads) x (seq_len, head_dim, n_heads) -> (seq_len, head_dim, n_heads)
@@ -145,14 +139,14 @@ struct Decoder
 	ln::LayerNorm
 end
 
-function (m::Decoder)(x::AbstractMatrix{Float32})
+function (m::Decoder)(input::AbstractMatrix{Float32})
 	# phi does layer normalization pre-attention
 	# x of shape (d_model, seq_len)
-	x = m.ln(x)
+	x = m.ln(input)
 
 	attn_res = m.self_attn(x)
 	mlp_res = m.mlp(x)
-	return x + attn_res + mlp_res
+	return input .+ attn_res .+ mlp_res
 end
 # ======================= Decoder =======================
 
@@ -184,10 +178,109 @@ end
 # ======================= Transformer =======================
 
 
+function load_weights(model::Transformer, state_dict)
+	for (key, value) in state_dict
+		origkey = key
+		if startswith(key, "model.layers")
+			key = split(key, "model.layers.")[2]
+			layer_num = parse(Int, split(key, ".")[1]) + 1 # state dict is 0-indexed
+			layer_name = split(key, ".")[2] # can be self_attn, mlp
+			if layer_name == "self_attn"
+				# can be q_proj, k_proj, v_proj, dense (Wo)
+				sublayer = split(key, ".")[3]
+				decoder = model.decoders[layer_num]
+
+				param_name = split(key, ".")[4]
+
+				if param_name == "weight"
+					if sublayer == "q_proj"
+						decoder.self_attn.Wq.weight .= value
+					elseif sublayer == "k_proj"
+						decoder.self_attn.Wk.weight .= value
+					elseif sublayer == "v_proj"
+						decoder.self_attn.Wv.weight .= value
+					elseif sublayer == "dense"
+						decoder.self_attn.Wo.weight .= value
+					else
+						error("Invalid sublayer: $origkey")
+					end
+				elseif param_name == "bias"
+					if sublayer == "q_proj"
+						decoder.self_attn.Wq.bias .= value
+					elseif sublayer == "k_proj"
+						decoder.self_attn.Wk.bias .= value
+					elseif sublayer == "v_proj"
+						decoder.self_attn.Wv.bias .= value
+					elseif sublayer == "dense"
+						decoder.self_attn.Wo.bias .= value
+					else
+						error("Invalid sublayer: $origkey")
+					end
+				else
+					error("Invalid param name: $origkey")
+				end
+			elseif layer_name == "mlp"
+				# sublayer can be fc1, fc2
+				sublayer = split(key, ".")[3]
+				decoder = model.decoders[layer_num]
+
+				param_name = split(key, ".")[4]
+
+				if param_name == "weight"
+					if sublayer == "fc1"
+						decoder.mlp.dense1.weight .= value
+					elseif sublayer == "fc2"
+						decoder.mlp.dense2.weight .= value
+					else
+						error("Invalid sublayer: $origkey")
+					end
+				elseif param_name == "bias"
+					if sublayer == "fc1"
+						decoder.mlp.dense1.bias .= value
+					elseif sublayer == "fc2"
+						decoder.mlp.dense2.bias .= value
+					else
+						error("Invalid sublayer: $origkey")
+					end
+				else
+					error("Invalid param name: $origkey")
+				end
+
+			elseif layer_name == "input_layernorm"
+				# can be weight, bias
+				param_name = split(key, ".")[3]
+				if param_name == "weight"
+					model.ln.diag.scale .= value
+				elseif param_name == "bias"
+					model.ln.diag.bias .= value
+				else
+					error("Invalid param name: $origkey")
+				end
+			else
+				error("Invalid layer name: $origkey")
+			end
+		elseif key == "model.final_layernorm.weight"
+			model.ln.diag.scale .= value
+		elseif key == "model.final_layernorm.bias"
+			model.ln.diag.bias .= value
+		elseif key == "lm_head.weight"
+			model.dense.weight .= value
+		elseif key == "lm_head.bias"
+			model.dense.bias .= value
+		elseif key == "model.embed_tokens.weight"
+			# embeddings are transposed wrt pytorch ones in Flux
+			value = permutedims(value, (2, 1))
+			model.embeddings.weight .= value
+		else
+			error("Invalid key: $origkey")
+		end
+	end
+end
 
 # ======================= Main =======================
 function main()
 	# load the phi tokenizer
+
 	weights = Transformers.load_state_dict("microsoft/phi-1")
 	cfg = Transformers.load_config("microsoft/phi-1")
 	#n_hidden_layers = cfg["n_hidden_layers"]
@@ -202,11 +295,11 @@ function main()
 
 	rotary_dim = Int((d_model // num_attention_heads) * partial_rotary_factor)
 
-	for (key, value) in weights
-		println("name: ", key, " shape: ", size(value))
-	end
+	#for (key, value) in weights
+	#println("name: ", key, " shape: ", size(value))
+	#end
 	tokenizer = Transformers.load_tokenizer("microsoft/phi-1")
-	input = Transformers.encode(tokenizer, "Hello, world!").token
+	input = Transformers.encode(tokenizer, "Yesterday I went to the shop for a bike").token
 	input = Flux.onecold(input, 1:size(input, 1))
 
 	println("input: ", input)
@@ -215,6 +308,7 @@ function main()
 	transformer =
 		Transformer([Decoder(SelfAttention(d_model, num_attention_heads, rotary_dim), MLP(d_model, d_ffn), LayerNorm(d_model)) for _ in 1:num_hidden_layers], Embedding(vocab_size, d_model), LayerNorm(d_model), Dense(d_model, vocab_size, identity))
 
+	load_weights(transformer, weights)
 
 	# forward
 	y = transformer(input)
